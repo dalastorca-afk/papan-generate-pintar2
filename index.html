@@ -9,6 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
   <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js"></script>
@@ -1188,58 +1189,233 @@
     }
 
     // ==========================================
-    // IMPORT FAIL (.xlsx, .docx, .txt)
+    // IMPORT FAIL (.xlsx, .docx, .txt) + PENGESAN WARNA SEL
     // ==========================================
-    function parseImportedRows(rows) {
+    function classifyHexToQuality(hex) {
+      if (!hex) return null;
+      let clean = String(hex).replace("#", "").trim().toUpperCase();
+      if (clean.length === 8) clean = clean.slice(2); // Buang alpha ARGB
+      if (clean.length !== 6) return null;
+      if (clean === "FFFFFF" || clean === "000000" || clean === "D9EAF7") return null;
+
+      const r = parseInt(clean.slice(0, 2), 16);
+      const g = parseInt(clean.slice(2, 4), 16);
+      const b = parseInt(clean.slice(4, 6), 16);
+
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const diff = max - min;
+      if (diff < 25) return null; // Warna kelabu/putih/hitam
+
+      // Hitung Hue (0 - 360)
+      let hue = 0;
+      if (max === r) hue = ((g - b) / diff) % 6;
+      else if (max === g) hue = (b - r) / diff + 2;
+      else hue = (r - g) / diff + 4;
+      hue = Math.round(hue * 60);
+      if (hue < 0) hue += 360;
+
+      // Hijau (termasuk Lime #99FF33, #00FF00, dll) -> PANDAI
+      if (hue >= 70 && hue <= 165) return "PANDAI";
+      // Kuning / Amber (#FFFF00, dll) -> SEDERHANA
+      if (hue >= 35 && hue < 70) return "SEDERHANA";
+      // Merah (#FF0000, merah jambu pekat, dll) -> LEMAH
+      if (hue <= 25 || hue >= 330) return "LEMAH";
+      return null;
+    }
+
+    async function extractXlsxColors(arrayBuffer) {
+      const sheetColorMaps = {};
+      if (!window.JSZip) return sheetColorMaps;
+      try {
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        const stylesFile = zip.file("xl/styles.xml");
+        if (!stylesFile) return sheetColorMaps;
+
+        const stylesXml = await stylesFile.async("string");
+        const parser = new DOMParser();
+        const stylesDoc = parser.parseFromString(stylesXml, "application/xml");
+
+        // Baca senarai fills
+        const fills = Array.from(stylesDoc.querySelectorAll("fills > fill")).map(fillEl => {
+          const fg = fillEl.querySelector("patternFill > fgColor");
+          if (!fg) return null;
+          const rgb = fg.getAttribute("rgb");
+          if (rgb) return classifyHexToQuality(rgb);
+          return null;
+        });
+
+        // Baca senarai cellXfs -> fillId
+        const xfQualities = Array.from(stylesDoc.querySelectorAll("cellXfs > xf")).map(xf => {
+          const fillId = parseInt(xf.getAttribute("fillId") || "0", 10);
+          return fills[fillId] || null;
+        });
+
+        // Baca setiap worksheet
+        const sheetPaths = Object.keys(zip.files).filter(p => /^xl\/worksheets\/sheet\d+\.xml$/i.test(p)).sort();
+        for (const sp of sheetPaths) {
+          const sheetXml = await zip.file(sp).async("string");
+          const sheetDoc = parser.parseFromString(sheetXml, "application/xml");
+          const cellMap = {};
+          sheetDoc.querySelectorAll("sheetData > row > c").forEach(c => {
+            const ref = c.getAttribute("r");
+            const sIdx = c.getAttribute("s");
+            if (ref && sIdx !== null) {
+              const q = xfQualities[parseInt(sIdx, 10)];
+              if (q) cellMap[ref] = q;
+            }
+          });
+          sheetColorMaps[sp] = cellMap;
+        }
+      } catch (e) {
+        console.warn("Gagal membaca warna XLSX:", e);
+      }
+      return sheetColorMaps;
+    }
+
+    async function extractDocxParagraphColors(arrayBuffer) {
+      const lineColors = [];
+      if (!window.JSZip) return lineColors;
+      try {
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        const docFile = zip.file("word/document.xml");
+        if (!docFile) return lineColors;
+        const xml = await docFile.async("string");
+        const doc = new DOMParser().parseFromString(xml, "application/xml");
+        doc.querySelectorAll("p, tr").forEach(node => {
+          const text = (node.textContent || "").trim();
+          if (!text) return;
+          let q = null;
+          const hl = node.querySelector("highlight");
+          if (hl) {
+            const v = (hl.getAttribute("w:val") || hl.getAttribute("val") || "").toLowerCase();
+            if (v.includes("green")) q = "PANDAI";
+            else if (v.includes("yellow")) q = "SEDERHANA";
+            else if (v.includes("red") || v.includes("magenta")) q = "LEMAH";
+          }
+          if (!q) {
+            const shd = node.querySelector("shd");
+            if (shd) q = classifyHexToQuality(shd.getAttribute("w:fill") || shd.getAttribute("fill"));
+          }
+          if (!q) {
+            const clr = node.querySelector("color");
+            if (clr) q = classifyHexToQuality(clr.getAttribute("w:val") || clr.getAttribute("val"));
+          }
+          if (q) lineColors.push({ text: text.toUpperCase(), quality: q });
+        });
+      } catch (e) {
+        console.warn("Gagal membaca warna DOCX:", e);
+      }
+      return lineColors;
+    }
+
+    function colIndexToLetter(idx) {
+      let s = "";
+      let n = idx + 1;
+      while (n > 0) {
+        const mod = (n - 1) % 26;
+        s = String.fromCharCode(65 + mod) + s;
+        n = Math.floor((n - mod) / 26);
+      }
+      return s;
+    }
+
+    function parseImportedRows(rows, cellColorMap = null, docxColors = null) {
       if (!rows || rows.length === 0) return [];
       const parsed = [];
-      let headerIdx = -1;
-      let colMap = { nama: 0, kualiti: -1, tingkahLaku: -1, jawatan: -1, kelasAsal: -1, jantina: -1 };
+      let colMap = { bil: -1, nama: 0, kualiti: -1, tingkahLaku: -1, jawatan: -1, kelasAsal: -1, jantina: -1 };
+      let currentSectionClass = "";
 
-      // Check if first row is header
-      const firstRow = rows[0].map(c => String(c || "").toUpperCase().trim());
-      if (firstRow.some(h => h.includes("NAMA") || h.includes("MURID"))) {
-        headerIdx = 0;
-        firstRow.forEach((h, i) => {
-          if (h.includes("NAMA")) colMap.nama = i;
-          else if (h.includes("KUALITI") || h.includes("TAHAP") || h.includes("PENCAPAIAN")) colMap.kualiti = i;
-          else if (h.includes("TINGKAH") || h.includes("KELAKUAN") || h.includes("DISIPLIN")) colMap.tingkahLaku = i;
-          else if (h.includes("JAWATAN") || h.includes("TUGAS")) colMap.jawatan = i;
-          else if (h.includes("KELAS") || h.includes("ASAL")) colMap.kelasAsal = i;
-          else if (h.includes("JANTINA")) colMap.jantina = i;
-        });
-      }
-
-      const start = headerIdx === 0 ? 1 : 0;
-      for (let r = start; r < rows.length; r++) {
+      for (let r = 0; r < rows.length; r++) {
         const row = rows[r];
-        if (!row || row.length === 0) continue;
-        // Handle single-column name or multi-column
+        if (!row || row.every(c => String(c || "").trim() === "")) continue;
+
+        const rowUpper = row.map(c => String(c || "").toUpperCase().trim());
+        const joinedUpper = rowUpper.join(" ").trim();
+
+        // Kesan tajuk seksyen kelas (cth: SENARAI NAMA MURID TAHUN 4 NILAM)
+        const secMatch = joinedUpper.match(/TAHUN\s*[1-6]\s+([A-Z0-9]+)/);
+        if (secMatch && (joinedUpper.includes("SENARAI") || joinedUpper.includes("KELAS"))) {
+          currentSectionClass = ("4 " + secMatch[1]).trim();
+          continue;
+        }
+        if (joinedUpper.startsWith("JUMLAH MURID")) continue;
+
+        // Kesan baris pengepala jadual (sama ada di baris 1 atau pertengahan helaian)
+        if (rowUpper.some(h => h === "NAMA" || h === "NAMA MURID" || h.includes("NAMA MURID"))) {
+          colMap = { bil: -1, nama: 0, kualiti: -1, tingkahLaku: -1, jawatan: -1, kelasAsal: -1, jantina: -1 };
+          rowUpper.forEach((h, i) => {
+            if (h === "BIL" || h === "BIL.") colMap.bil = i;
+            else if (h.includes("NAMA")) colMap.nama = i;
+            else if (h.includes("KUALITI") || h.includes("TAHAP") || h.includes("PENCAPAIAN")) colMap.kualiti = i;
+            else if (h.includes("TINGKAH") || h.includes("KELAKUAN") || h.includes("DISIPLIN") || h.includes("CATATAN")) colMap.tingkahLaku = i;
+            else if (h.includes("JAWATAN") || h.includes("TUGAS")) colMap.jawatan = i;
+            else if (h.includes("KELAS")) colMap.kelasAsal = i;
+            else if (h.includes("JANTINA")) colMap.jantina = i;
+          });
+          continue;
+        }
+
+        // Abaikan baris contoh (CTH / CONTOH)
+        if (colMap.bil >= 0) {
+          const bilVal = String(row[colMap.bil] || "").toUpperCase().trim();
+          if (bilVal === "CTH" || bilVal === "CONTOH") continue;
+        }
+
         let nama = String(row[colMap.nama] || "").trim();
+        let namaColIdx = colMap.nama;
         if (!nama || /^\d+$/.test(nama)) {
-          // Maybe column 0 is Bil, column 1 is Nama
           if (row[1] && String(row[1]).trim().length > 2) {
             nama = String(row[1]).trim();
+            namaColIdx = 1;
           } else {
             continue;
           }
         }
-        const kualiti = colMap.kualiti >= 0 ? normalizeQuality(row[colMap.kualiti]) : normalizeQuality(row.join(" "));
-        const tingkahLaku = colMap.tingkahLaku >= 0 ? normalizeBehavior(row[colMap.tingkahLaku]) : normalizeBehavior(row.join(" "));
-        const jawatan = colMap.jawatan >= 0 ? normalizeRole(row[colMap.jawatan]) : normalizeRole(row.join(" "));
-        const kelasAsal = colMap.kelasAsal >= 0 ? String(row[colMap.kelasAsal] || "").trim() : "";
+
+        // 1. Kesan Kualiti daripada WARNA SEL Excel atau DOCX dahulu
+        let detectedQuality = null;
+        if (cellColorMap) {
+          const excelRowNum = r + 1;
+          const namaRef = colIndexToLetter(namaColIdx) + excelRowNum;
+          detectedQuality = cellColorMap[namaRef] || null;
+          if (!detectedQuality) {
+            for (let ci = 0; ci < row.length; ci++) {
+              const ref = colIndexToLetter(ci) + excelRowNum;
+              if (cellColorMap[ref]) {
+                detectedQuality = cellColorMap[ref];
+                break;
+              }
+            }
+          }
+        }
+        if (!detectedQuality && docxColors && docxColors.length > 0) {
+          const upperNama = nama.toUpperCase();
+          const match = docxColors.find(d => d.text.includes(upperNama));
+          if (match) detectedQuality = match.quality;
+        }
+
+        const kualiti = detectedQuality
+          ? detectedQuality
+          : (colMap.kualiti >= 0 ? normalizeQuality(row[colMap.kualiti]) : normalizeQuality(joinedUpper));
+
+        const tingkahLaku = colMap.tingkahLaku >= 0 ? normalizeBehavior(row[colMap.tingkahLaku]) : normalizeBehavior(joinedUpper);
+        const jawatan = colMap.jawatan >= 0 ? normalizeRole(row[colMap.jawatan]) : normalizeRole(joinedUpper);
+        const kelasAsal = (colMap.kelasAsal >= 0 && row[colMap.kelasAsal])
+          ? String(row[colMap.kelasAsal]).trim()
+          : currentSectionClass;
         const jantina = colMap.jantina >= 0 && row[colMap.jantina]
           ? (String(row[colMap.jantina]).toUpperCase().startsWith("P") ? "P" : "L")
           : detectGenderFromName(nama);
 
         parsed.push({
           id: "M" + Date.now().toString().slice(-4) + String(parsed.length + 1).padStart(3, "0"),
-          nama,
+          nama: nama.toUpperCase(),
           jantina,
           kualiti,
           tingkahLaku,
           jawatan,
-          kelasAsal,
+          kelasAsal: kelasAsal.toUpperCase(),
           kelasBaharu: ""
         });
       }
@@ -1254,20 +1430,26 @@
         if (ext === "xlsx" || ext === "xls" || ext === "csv") {
           const buf = await file.arrayBuffer();
           const wb = XLSX.read(buf, { type: "array" });
-          const sheet = wb.Sheets[wb.SheetNames[0]];
-          const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
-          importedStudents = parseImportedRows(rows);
+          const colorMaps = ext === "xlsx" ? await extractXlsxColors(buf) : {};
+          const sheetKeys = Object.keys(colorMaps);
+          wb.SheetNames.forEach((sName, sIdx) => {
+            const sheet = wb.Sheets[sName];
+            const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+            const cMap = colorMaps[sheetKeys[sIdx]] || null;
+            importedStudents = importedStudents.concat(parseImportedRows(rows, cMap, null));
+          });
         } else if (ext === "docx") {
           const buf = await file.arrayBuffer();
+          const docxColors = await extractDocxParagraphColors(buf);
           const res = await mammoth.extractRawText({ arrayBuffer: buf });
           const lines = res.value.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
           const rows = lines.map(l => l.split(/\t|\||,|;/).map(c => c.trim()));
-          importedStudents = parseImportedRows(rows);
+          importedStudents = parseImportedRows(rows, null, docxColors);
         } else if (ext === "txt") {
           const text = await file.text();
           const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
           const rows = lines.map(l => l.split(/\t|\||,|;/).map(c => c.trim()));
-          importedStudents = parseImportedRows(rows);
+          importedStudents = parseImportedRows(rows, null, null);
         } else {
           showToast("Format fail tidak disokong. Sila guna .xlsx, .docx, atau .txt", "error");
           return;
@@ -1283,7 +1465,10 @@
         const numCls = parseInt(document.getElementById("numClassesSelect").value, 10) || 7;
         const preset = document.getElementById("splitPresetSelect").value;
         generateClassesAlgorithm(numCls, preset, false);
-        showToast(`Berjaya mengimport ${importedStudents.length} murid daripada ${file.name}!`, "success");
+        const cntP = importedStudents.filter(x => x.kualiti === "PANDAI").length;
+        const cntS = importedStudents.filter(x => x.kualiti === "SEDERHANA").length;
+        const cntL = importedStudents.filter(x => x.kualiti === "LEMAH").length;
+        showToast(`Import ${importedStudents.length} murid berjaya! (Pandai: ${cntP}, Sederhana: ${cntS}, Lemah: ${cntL})`, "success");
       } catch (err) {
         showToast("Ralat membaca fail: " + err.message, "error");
       }
